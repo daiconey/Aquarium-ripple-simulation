@@ -366,7 +366,7 @@
             waterGeometry.attributes.color.needsUpdate = true;
             waterGeometry.computeVertexNormals();
 
-            // 2. 立方体の物理挙動（浮力と重力）
+            // 2. 立方体の物理挙動（より正確なアルキメデスの原理）
             if (!isDragging) {
                 // 現在位置の水の高さを取得
                 const gridX = Math.floor((cube.position.x + tankSize / 2) / tankSize * resolution);
@@ -379,22 +379,32 @@
 
                 const g = 0.015; // 重力加速度のベース
 
-                if (cube.position.y < currentWaterHeight) {
-                    // 水中：アルキメデスの原理に基づく浮力の計算
-                    // 浮力 = 水の密度 * 重力 (体積は一定とする)
-                    const buoyancy = params.waterDensity * g;
-                    const gravityForce = params.cubeMass * g;
-                    // 運動方程式: 加速度 = (浮力 - 重力) / 質量
-                    const acceleration = (buoyancy - gravityForce) / params.cubeMass;
-                    
-                    cubeVelocity.y += acceleration; 
-                    cubeVelocity.y *= params.waterDrag; // 水の抵抗
-                } else {
-                    // 空中：重力のみが働く
-                    const acceleration = -g;
-                    cubeVelocity.y += acceleration; 
-                    cubeVelocity.y *= 0.98; // 空気の抵抗
+                // 立方体が水に浸かっている割合（0.0: 完全空中 ～ 1.0: 完全水中）を計算
+                const cubeBottom = cube.position.y - cubeSize / 2;
+                const cubeTop = cube.position.y + cubeSize / 2;
+                let submergedRatio = 0;
+
+                if (currentWaterHeight >= cubeTop) {
+                    submergedRatio = 1.0; // 完全に水没
+                } else if (currentWaterHeight > cubeBottom) {
+                    submergedRatio = (currentWaterHeight - cubeBottom) / cubeSize; // 部分的に浸かっている
                 }
+
+                // 重力 (下向き) = 質量 * 重力加速度
+                const gravityForce = params.cubeMass * g;
+                
+                // 浮力 (上向き) = 水の密度 * 「浸かっている体積の割合」 * 重力加速度
+                const buoyancyForce = params.waterDensity * submergedRatio * g;
+                
+                // 運動方程式: 加速度 = (浮力 - 重力) / 質量
+                const acceleration = (buoyancyForce - gravityForce) / params.cubeMass;
+                
+                cubeVelocity.y += acceleration; 
+
+                // 抵抗 (空気の抵抗と水の抵抗を、浸かっている割合に応じて滑らかにブレンド)
+                const airDrag = 0.98;
+                const currentDrag = airDrag * (1 - submergedRatio) + params.waterDrag * submergedRatio;
+                cubeVelocity.y *= currentDrag;
 
                 const previousY = cube.position.y;
                 cube.position.y += cubeVelocity.y;
