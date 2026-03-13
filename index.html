@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Bumpy Water Tank Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            color: rgba(255, 255, 255, 0.9);
+            pointer-events: none;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+        }
+        h1 {
+            margin: 0 0 10px 0;
+            font-size: 24px;
+            font-weight: 400;
+        }
+        p {
+            margin: 0;
+            font-size: 14px;
+        }
+        
+        /* GUI全体の幅を広げ、ラベル領域の幅を固定することでスライダーの長さを統一 */
+        .lil-gui {
+            --width: 400px !important;
+            --name-width: 45% !important;
+        }
+    </style>
+    <!-- Three.jsとそのアドオンをESモジュールとして読み込むための設定 -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="ui">
+        <h1>立方体水槽シミュレーション</h1>
+        <p>赤い立方体をドラッグして、水中や水面を自由に動かしてみましょう</p>
+        <p style="font-size: 13px; margin-top: 5px; color: #aaddff;">💡 右上のパネルで物理パラメータを変更し、波の動きや「アルキメデスの原理(浮力)」を実験してみよう！</p>
+    </div>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { DragControls } from 'three/addons/controls/DragControls.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+        // --- 物理パラメータ (UIで変更可能) ---
+        const params = {
+            waterColor: '#00aaff', // 水の色を明るく鮮やかにして分かりやすく
+            waveColorIntensity: 1.5, // 波紋の色強調
+            waveDamping: 0.97,     // 波の減衰率
+            cubeMass: 1.0,         // 物体の質量
+            waterDensity: 1.2,     // 水の密度 (浮力の強さ)
+            waterDrag: 0.92        // 水中の抵抗
+        };
+
+        // --- 基本設定 ---
+        const container = document.getElementById('canvas-container');
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color('#10141a');
+
+        const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
+        camera.position.set(0, 12, 18);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.shadowMap.enabled = true;
+        renderer.localClippingEnabled = true; // 水中ボリュームの断面をカット(クリッピング)するために必要
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.maxPolarAngle = Math.PI / 2 + 0.2; // 少しだけ下からも見れるように
+
+        // --- ライティング ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 2.5);
+        dirLight.position.set(5, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        scene.add(dirLight);
+
+        // --- 立方体水槽の生成 ---
+        const tankSize = 12; // 水槽のサイズ
+        const tankHeight = 8;
+        const bottomY = -tankHeight / 2 - 1; // 底のY座標
+        
+        const tankGeometry = new THREE.BoxGeometry(tankSize, tankHeight, tankSize);
+
+        const glassMaterial = new THREE.MeshPhysicalMaterial({
+            color: 0xffffff,
+            metalness: 0.1,
+            roughness: 0.0,
+            transmission: 0.99, // ほぼ完全に透明
+            thickness: 0.5,     // 屈折を控えめに
+            opacity: 1,
+            transparent: true,
+            side: THREE.BackSide, // 直方体の場合は内側を描画してスッキリ見せる
+            depthWrite: false
+        });
+        
+        const tank = new THREE.Mesh(tankGeometry, glassMaterial);
+        tank.position.y = -1; // 水面(Y=0)に対して水槽の深さを調整
+        scene.add(tank);
+
+        // 水槽の輪郭線（エッジ）を描画して、透明でも形が分かるようにする
+        const edges = new THREE.EdgesGeometry(tankGeometry);
+        const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, opacity: 0.3, transparent: true }));
+        line.position.copy(tank.position);
+        scene.add(line);
+
+        // --- 水面のシミュレーション設定 ---
+        const resolution = 128;
+        const damping = 0.97;
+        let heightBuffer1 = new Float32Array(resolution * resolution);
+        let heightBuffer2 = new Float32Array(resolution * resolution);
+
+        // 水面のジオメトリ作成
+        const waterGeometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(resolution * resolution * 3);
+        const indices = [];
+
+        for (let i = 0; i < resolution; i++) {
+            for (let j = 0; j < resolution; j++) {
+                const x = (i / (resolution - 1)) * tankSize - tankSize / 2;
+                const z = (j / (resolution - 1)) * tankSize - tankSize / 2;
+                const idx = i + j * resolution;
+                
+                positions[idx * 3] = x;
+                positions[idx * 3 + 1] = 0;
+                positions[idx * 3 + 2] = z;
+
+                if (i < resolution - 1 && j < resolution - 1) {
+                    const a = i + j * resolution;
+                    const b = i + 1 + j * resolution;
+                    const c = i + (j + 1) * resolution;
+                    const d = i + 1 + (j + 1) * resolution;
+                    indices.push(a, c, b);
+                    indices.push(b, c, d);
+                }
+            }
+        }
+
+        waterGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        waterGeometry.setIndex(indices);
+        
+        // 波紋の色付け用に頂点カラーのバッファを追加
+        const colors = new Float32Array(resolution * resolution * 3);
+        waterGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        
+        waterGeometry.computeVertexNormals();
+
+        const waterBaseColor = new THREE.Color(params.waterColor);
+
+        const waterMaterial = new THREE.MeshPhysicalMaterial({
+            color: 0xffffff, // 頂点カラーを基準にするため白に設定
+            vertexColors: true, // 波紋の色変化を有効化
+            metalness: 0.1,
+            roughness: 0.2,
+            transmission: 0.75,
+            transparent: true,
+            opacity: 0.9,
+            ior: 1.33,
+            side: THREE.DoubleSide,
+            depthWrite: false // 中の物体（赤い立方体）を透けやすくする
+        });
+
+        const waterMesh = new THREE.Mesh(waterGeometry, waterMaterial);
+        scene.add(waterMesh);
+
+        // --- 水中のボリューム（色付きの空間）を表現して視認性をアップ ---
+        // 水面(Y=0)より下の部分だけを描画するためのクリッピング平面
+        const waterClipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0.1); 
+        
+        const waterVolumeMaterial = new THREE.MeshBasicMaterial({
+            color: new THREE.Color(params.waterColor),
+            transparent: true,
+            opacity: 0.45, // 水の深さを表現する色の濃さ（少し濃く）
+            side: THREE.DoubleSide,
+            clippingPlanes: [waterClipPlane],
+            depthWrite: false
+        });
+        // 水槽と同じ形を作り、水面より下だけ色をつける
+        const waterVolume = new THREE.Mesh(tankGeometry, waterVolumeMaterial);
+        waterVolume.position.copy(tank.position);
+        waterVolume.scale.set(0.99, 1.0, 0.99); // タンクの外壁と重ならないように少し小さくする
+        scene.add(waterVolume);
+
+
+        // --- GUIパネルの設定 (物理の実験用) ---
+        const gui = new GUI({ title: '🧪 物理シミュレータ' });
+        
+        gui.addColor(params, 'waterColor').name('水の色').onChange(value => {
+            waterBaseColor.set(value); // 水面メッシュ用のベースカラーを更新
+            waterVolumeMaterial.color.set(value); // 水中空間の色も同時に変える
+        });
+        
+        const physicsFolder = gui.addFolder('波とアルキメデスの原理');
+        physicsFolder.add(params, 'waveColorIntensity', 0.0, 5.0).name('波紋の色の強調').step(0.1);
+        physicsFolder.add(params, 'waveDamping', 0.90, 0.999).name('波の持続力').step(0.001);
+        physicsFolder.add(params, 'cubeMass', 0.1, 3.0).name('物体の質量 (沈む力)').step(0.1);
+        physicsFolder.add(params, 'waterDensity', 0.1, 3.0).name('水の密度 (浮く力)').step(0.1);
+        physicsFolder.add(params, 'waterDrag', 0.80, 0.99).name('水の抵抗 (動きにくさ)').step(0.01);
+        physicsFolder.open();
+
+        // --- インタラクション用オブジェクト（立方体） ---
+        const cubeSize = 1.2;
+        const cubeGeometry = new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize);
+        const cubeMaterial = new THREE.MeshStandardMaterial({ 
+            color: 0xff4444,
+            roughness: 0.3,
+            metalness: 0.2
+        });
+        const cube = new THREE.Mesh(cubeGeometry, cubeMaterial);
+        cube.position.y = 0;
+        scene.add(cube);
+
+        // --- 波を起こす関数 ---
+        function disturbWater(x, z, strength) {
+            const i = Math.floor((x + tankSize / 2) / tankSize * resolution);
+            const j = Math.floor((z + tankSize / 2) / tankSize * resolution);
+            const radius = 5; // 波の半径
+
+            for (let rX = -radius; rX <= radius; rX++) {
+                for (let rZ = -radius; rZ <= radius; rZ++) {
+                    const currI = i + rX;
+                    const currJ = j + rZ;
+                    
+                    if (currI > 0 && currI < resolution - 1 && currJ > 0 && currJ < resolution - 1) {
+                        const dist = Math.sqrt(rX * rX + rZ * rZ);
+                        if (dist < radius) {
+                            const idx = currI + currJ * resolution;
+                            // 滑らかな波のくぼみを作る
+                            heightBuffer1[idx] -= strength * Math.cos((dist / radius) * (Math.PI / 2)); 
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- ドラッグ操作 (XYZすべての軸) ---
+        let isDragging = false;
+        let previousCubePosition = new THREE.Vector3();
+        let cubeVelocity = new THREE.Vector3(); // 浮力・重力アニメーション用
+
+        const dragControls = new DragControls([cube], camera, renderer.domElement);
+        
+        dragControls.addEventListener('dragstart', function (event) {
+            controls.enabled = false;
+            isDragging = true;
+            previousCubePosition.copy(cube.position);
+            document.body.style.cursor = 'grabbing';
+            cubeVelocity.set(0, 0, 0);
+        });
+
+        dragControls.addEventListener('drag', function (event) {
+            // 水槽の壁を突き抜けないように位置をクランプ（立方体用）
+            const limit = tankSize / 2 - cubeSize / 2 - 0.1;
+            cube.position.x = Math.max(-limit, Math.min(limit, cube.position.x));
+            cube.position.z = Math.max(-limit, Math.min(limit, cube.position.z));
+            
+            // 高さのクランプ（空高くや底を突き抜けないように）
+            cube.position.y = Math.max(bottomY + cubeSize / 2, Math.min(cube.position.y, 5));
+
+            // 移動距離を計算して波を起こす
+            const moveDist = cube.position.distanceTo(previousCubePosition);
+            if (moveDist > 0.02) {
+                // 水中深くにある時は波を弱くする
+                let depthFactor = 0;
+                if (cube.position.y <= 0.6 && cube.position.y >= bottomY) {
+                    // 水面(Y=0)付近で最大、底で最小
+                    depthFactor = 1.0 - Math.abs(cube.position.y) / Math.abs(bottomY);
+                    depthFactor = Math.max(0, depthFactor);
+                }
+                
+                if (depthFactor > 0) {
+                    disturbWater(cube.position.x, cube.position.z, Math.min(moveDist * 0.8, 1.0) * depthFactor);
+                }
+            }
+            previousCubePosition.copy(cube.position);
+        });
+
+        dragControls.addEventListener('dragend', function (event) {
+            controls.enabled = true;
+            isDragging = false;
+            document.body.style.cursor = 'default';
+        });
+
+        // リサイズ処理
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- アニメーションループ ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            controls.update();
+
+            // 1. 波のシミュレーション更新
+            for (let i = 1; i < resolution - 1; i++) {
+                for (let j = 1; j < resolution - 1; j++) {
+                    const idx = i + j * resolution;
+                    
+                    // 波の伝播を計算
+                    let newHeight = (
+                        heightBuffer1[idx - 1] +
+                        heightBuffer1[idx + 1] +
+                        heightBuffer1[idx - resolution] +
+                        heightBuffer1[idx + resolution]
+                    ) / 2 - heightBuffer2[idx];
+
+                    heightBuffer2[idx] = newHeight * params.waveDamping; // パラメータを使用
+                }
+            }
+
+            // バッファをスワップ
+            let temp = heightBuffer1;
+            heightBuffer1 = heightBuffer2;
+            heightBuffer2 = temp;
+
+            // ジオメトリの頂点と色の更新
+            const posArray = waterGeometry.attributes.position.array;
+            const colArray = waterGeometry.attributes.color.array;
+            for (let i = 0; i < resolution * resolution; i++) {
+                const h = heightBuffer1[i];
+                posArray[i * 3 + 1] = h; // 高さの更新
+
+                // 波の高さに応じて色を変化させる（高い部分は明るく、低い部分は暗く）
+                const highlight = h * params.waveColorIntensity;
+                colArray[i * 3]     = Math.max(0, Math.min(1, waterBaseColor.r + highlight));
+                colArray[i * 3 + 1] = Math.max(0, Math.min(1, waterBaseColor.g + highlight));
+                colArray[i * 3 + 2] = Math.max(0, Math.min(1, waterBaseColor.b + highlight));
+            }
+            waterGeometry.attributes.position.needsUpdate = true;
+            waterGeometry.attributes.color.needsUpdate = true;
+            waterGeometry.computeVertexNormals();
+
+            // 2. 立方体の物理挙動（浮力と重力）
+            if (!isDragging) {
+                // 現在位置の水の高さを取得
+                const gridX = Math.floor((cube.position.x + tankSize / 2) / tankSize * resolution);
+                const gridZ = Math.floor((cube.position.z + tankSize / 2) / tankSize * resolution);
+                let currentWaterHeight = 0;
+                
+                if(gridX > 0 && gridX < resolution && gridZ > 0 && gridZ < resolution) {
+                    currentWaterHeight = heightBuffer1[gridX + gridZ * resolution];
+                }
+
+                const g = 0.015; // 重力加速度のベース
+
+                if (cube.position.y < currentWaterHeight) {
+                    // 水中：アルキメデスの原理に基づく浮力の計算
+                    // 浮力 = 水の密度 * 重力 (体積は一定とする)
+                    const buoyancy = params.waterDensity * g;
+                    const gravityForce = params.cubeMass * g;
+                    // 運動方程式: 加速度 = (浮力 - 重力) / 質量
+                    const acceleration = (buoyancy - gravityForce) / params.cubeMass;
+                    
+                    cubeVelocity.y += acceleration; 
+                    cubeVelocity.y *= params.waterDrag; // 水の抵抗
+                } else {
+                    // 空中：重力のみが働く
+                    const acceleration = -g;
+                    cubeVelocity.y += acceleration; 
+                    cubeVelocity.y *= 0.98; // 空気の抵抗
+                }
+
+                const previousY = cube.position.y;
+                cube.position.y += cubeVelocity.y;
+
+                // 水面を突き抜けた瞬間に波を起こす（着水・出水）
+                const crossedWater = (previousY < currentWaterHeight && cube.position.y >= currentWaterHeight) ||
+                                     (previousY > currentWaterHeight && cube.position.y <= currentWaterHeight);
+                if (crossedWater && Math.abs(cubeVelocity.y) > 0.03) {
+                    disturbWater(cube.position.x, cube.position.z, Math.abs(cubeVelocity.y) * 1.8);
+                }
+
+                // 底にぶつかった時のバウンド
+                if (cube.position.y < bottomY + cubeSize / 2) {
+                    cube.position.y = bottomY + cubeSize / 2;
+                    cubeVelocity.y *= -0.3;
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // 初期状態で少し波を起こしておく
+        disturbWater(0, 0, 2);
+        
+        animate();
+    </script>
+</body>
+</html>
